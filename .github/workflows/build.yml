@@ -1,0 +1,165 @@
+name: GreenLemon Universal ZIP to JAR Builder
+
+# -----------------------------------------------------------------------------
+# Bu workflow, input_zips/ klasörüne eklenen ZIP dosyalarını tek tek analiz eder,
+# Gradle / Gradle Wrapper / Maven / çok modüllü / saf Java kaynak kodu / hazır JAR
+# projelerini tespit edip güvenli biçimde derlemeye çalışır ve sonuçları
+# GitHub Actions Artifact'leri olarak yayınlar.
+#
+# Tetikleyiciler:
+#   - workflow_dispatch : manuel çalıştırma (isteğe bağlı parametrelerle)
+#   - push              : input_zips/ altına yeni/güncel bir .zip push edildiğinde
+# -----------------------------------------------------------------------------
+
+on:
+  workflow_dispatch:
+    inputs:
+      generate_sources_report:
+        description: "Kaynak kod analiz raporu da üretilsin mi? (GreenLemon-Sources)"
+        type: boolean
+        default: false
+      build_timeout_minutes:
+        description: "Proje başına maksimum derleme süresi (dakika)"
+        type: number
+        default: 25
+  push:
+    branches:
+      - "**"
+    paths:
+      - "input_zips/**.zip"
+
+permissions:
+  contents: read
+
+# Aynı anda birden fazla çalışmayı engelle; önceki çalışan workflow'u iptal et.
+concurrency:
+  group: greenlemon-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Analyze & Build ZIPs
+    runs-on: ubuntu-latest
+    # Tüm job için üst sınır. Tek bir proje takılırsa bile iş sonsuza kadar sürmez.
+    timeout-minutes: 120
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install Python dependencies
+        run: |
+          pip install --disable-pip-version-check --no-input -r scripts/requirements.txt
+
+      # Java 17 ve 21, en yaygın Paper/Spigot/Bukkit sürümleri için önceden ve
+      # hızlı/önbellekli şekilde kurulur. JAVA_HOME_17_X64 / JAVA_HOME_21_X64
+      # ortam değişkenleri sonraki adımlarda otomatik olarak kullanılabilir olur.
+      - name: Set up JDK 17 and JDK 21 (pre-cached)
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: |
+            17
+            21
+
+      # gradlew (wrapper) içermeyen projeler için "current" (güncel kararlı sürüm)
+      # bir Gradle dağıtımını PATH'e ekler. Wrapper'ı olan projeler yine kendi
+      # pinlenmiş Gradle sürümünü (gradlew aracılığıyla) kullanmaya devam eder.
+      #
+      # ÖNEMLİ: Gradle User Home (~/.gradle) bu action tarafından kendi
+      # mekanizmasıyla cache'lenir. Resmi dokümantasyon, bunun üzerine ayrıca
+      # actions/cache ile ~/.gradle önbelleklemeyi AÇIKÇA tavsiye etmiyor
+      # (çakışma / bozulma riski). Bu yüzden aşağıda sadece Maven (~/.m2)
+      # için actions/cache kullanıyoruz.
+      - name: Set up fallback Gradle (for projects without a wrapper)
+        uses: gradle/actions/setup-gradle@v6
+        with:
+          gradle-version: current
+
+      - name: Verify Maven availability
+        run: |
+          set -e
+          if ! command -v mvn >/dev/null 2>&1; then
+            echo "Maven bulunamadı, apt ile kuruluyor..."
+            sudo apt-get update -y
+            sudo apt-get install -y maven
+          fi
+          mvn -v
+
+      # Sadece Maven yerel deposunu cache'liyoruz. continue-on-error: true
+      # sayesinde cache adımı herhangi bir sebeple başarısız olsa bile
+      # (örn. GitHub Actions cache servisinde geçici sorun) tüm workflow
+      # ÇÖKMEZ, sadece önbellek kullanılmadan devam eder.
+      - name: Restore Maven dependency cache (best effort)
+        uses: actions/cache@v6
+        continue-on-error: true
+        with:
+          path: ~/.m2/repository
+          key: greenlemon-m2-${{ runner.os }}-${{ hashFiles('input_zips/**/*.zip') }}
+          restore-keys: |
+            greenlemon-m2-${{ runner.os }}-
+
+      - name: Prepare workspace directories
+        run: |
+          mkdir -p dist/jars dist/reports dist/sources work/extracted work/logs
+          # input_zips altında hiç zip yoksa bile pipeline çökmesin diye klasör garantiye alınır
+          mkdir -p input_zips
+
+      - name: Run GreenLemon analyzer & builder
+        id: run_build
+        env:
+          GENERATE_SOURCES_REPORT: ${{ inputs.generate_sources_report }}
+          BUILD_TIMEOUT_MINUTES: ${{ inputs.build_timeout_minutes || '25' }}
+        run: python3 scripts/main.py
+
+      - name: Check whether any JAR was produced
+        id: check_jars
+        if: always()
+        run: |
+          if [ -n "$(find dist/jars -maxdepth 1 -name '*.jar' 2>/dev/null)" ]; then
+            echo "has_jars=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_jars=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Publish summary to the Actions run page
+        if: always()
+        run: |
+          if [ -f dist/reports/SUMMARY.md ]; then
+            cat dist/reports/SUMMARY.md >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "GreenLemon: SUMMARY.md oluşturulamadı (beklenmeyen durum)." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      # JAR bulunamasa dahi iş akışı kırmızıya DÜŞMEZ; raporlar her koşulda yüklenir.
+      - name: Upload JAR artifacts (GreenLemon-JARs)
+        if: always() && steps.check_jars.outputs.has_jars == 'true'
+        uses: actions/upload-artifact@v6
+        with:
+          name: GreenLemon-JARs
+          path: dist/jars/*.jar
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Upload report artifacts (GreenLemon-Reports)
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: GreenLemon-Reports
+          path: dist/reports/**
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Upload source analysis artifacts (GreenLemon-Sources)
+        if: always() && inputs.generate_sources_report == true
+        uses: actions/upload-artifact@v6
+        with:
+          name: GreenLemon-Sources
+          path: dist/sources/**
+          if-no-files-found: ignore
+          retention-days: 14
+          
