@@ -1,5 +1,5 @@
 
-name: GreenLemon Universal ZIP Builder
+name: GreenLemon Universal JAR Builder
 
 on:
   workflow_dispatch:
@@ -16,76 +16,124 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Java 21
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Java 21
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '21'
-          cache: gradle
 
-
-      - name: Maven Setup
-        uses: stCarolas/setup-maven@v5
-        with:
-          maven-version: '3.9.9'
+      - name: Install Build Tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y maven unzip
+          curl -fsSL https://services.gradle.org/distributions/gradle-8.10.2-bin.zip -o /tmp/gradle.zip
+          sudo unzip -q /tmp/gradle.zip -d /opt
+          echo "/opt/gradle-8.10.2/bin" >> "$GITHUB_PATH"
 
       - name: Extract ZIP Files
         run: |
           mkdir -p extracted output
+
           find . -type f -name "*.zip" \
             -not -path "./extracted/*" \
-            -print0 | while IFS= read -r -d '' zip; do
-              name=$(basename "$zip" .zip)
+            -not -path "./.git/*" \
+            -print0 | while IFS= read -r -d '' file; do
+              name=$(basename "$file" .zip)
+              echo "Extracting: $name"
               mkdir -p "extracted/$name"
-              unzip -oq "$zip" -d "extracted/$name"
-            done
+              unzip -oq "$file" -d "extracted/$name"
+          done
 
-      - name: Find and Build Projects
+      - name: Build All Projects
+        id: build
         shell: bash
         run: |
-          set +e
-          mkdir -p output
-          while IFS= read -r -d '' file; do
-            dir=$(dirname "$file")
+          failed=0
+          count=0
+
+          mapfile -t projects < <(
+            find extracted -type f \( \
+              -name "gradlew" -o \
+              -name "build.gradle" -o \
+              -name "build.gradle.kts" -o \
+              -name "pom.xml" \
+            \) -printf '%h\n' | sort -u
+          )
+
+          for dir in "${projects[@]}"; do
             echo "================================"
-            echo "Project: $dir"
+            echo "BUILDING: $dir"
+            echo "================================"
+
             cd "$GITHUB_WORKSPACE/$dir"
 
             if [[ -f gradlew ]]; then
               chmod +x gradlew
               ./gradlew clean build --no-daemon
+              result=$?
             elif [[ -f build.gradle || -f build.gradle.kts ]]; then
               gradle clean build --no-daemon
+              result=$?
             elif [[ -f pom.xml ]]; then
-              mvn package -DskipTests
+              mvn -B package -DskipTests
+              result=$?
             else
-              cd "$GITHUB_WORKSPACE"
               continue
             fi
 
-            result=$?
-            if [ $result -eq 0 ]; then
-              find . -type f -name "*.jar" \
-                -not -name "*-sources.jar" \
-                -not -name "*-javadoc.jar" \
-                -exec cp {} "$GITHUB_WORKSPACE/output/" \;
-              echo "BUILD SUCCESS"
+            if [[ $result -eq 0 ]]; then
+              project=$(basename "$dir")
+
+              for folder in build/libs target; do
+                if [[ -d "$folder" ]]; then
+                  while IFS= read -r -d '' jar; do
+                    name=$(basename "$jar")
+                    cp "$jar" "$GITHUB_WORKSPACE/output/${project}-${name}"
+                    count=$((count + 1))
+                    echo "JAR CREATED: $name"
+                  done < <(find "$folder" -maxdepth 1 -type f -name "*.jar" \
+                    ! -name "*-sources.jar" \
+                    ! -name "*-javadoc.jar" -print0)
+                fi
+              done
             else
               echo "BUILD FAILED: $dir"
+              failed=1
             fi
 
             cd "$GITHUB_WORKSPACE"
-          done < <(find extracted -type f \( \
-            -name gradlew -o \
-            -name build.gradle -o \
-            -name build.gradle.kts -o \
-            -name pom.xml \
-            \) -print0)
+          done
+
+          echo "failed=$failed" >> "$GITHUB_OUTPUT"
+          echo "count=$count" >> "$GITHUB_OUTPUT"
+
+          if [[ ${#projects[@]} -eq 0 ]]; then
+            echo "No Gradle or Maven projects found!"
+          fi
 
       - name: Upload JAR Files
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: GreenLemon-JARs
           path: output/
           if-no-files-found: warn
+
+      - name: Check Build Result
+        if: always()
+        run: |
+          if [[ "${{ steps.build.outputs.failed }}" == "1" ]]; then
+            echo "Some projects failed to build."
+            exit 1
+          fi
+
+          if [[ "${{ steps.build.outputs.count }}" == "0" ]]; then
+            echo "No JAR files were generated."
+            exit 1
+          fi
+
+          echo "All builds completed!"
           
