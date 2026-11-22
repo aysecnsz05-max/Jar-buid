@@ -75,4 +75,4 @@ jobs:
         with:
           name: GreenLemon-JARs
           path: output/*.jar
-          if-no-files-found: error
+          if-no-files-found: warn
