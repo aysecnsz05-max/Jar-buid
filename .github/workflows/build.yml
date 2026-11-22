@@ -1,0 +1,78 @@
+
+name: GreenLemon - ZIP to JAR Builder
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'plugins/**/*.zip'
+      - '*.zip'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Java 21 Kur
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Gradle Kur
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: ZIP Dosyalarını Aç
+        run: |
+          mkdir -p extracted
+          find . -type f -name "*.zip" \
+            -not -path "./extracted/*" \
+            -exec sh -c '
+              name=$(basename "$1" .zip)
+              mkdir -p "extracted/$name"
+              unzip -oq "$1" -d "extracted/$name"
+            ' _ {} \;
+
+      - name: Gradle ve Maven Projelerini Derle
+        run: |
+          find extracted -type f \( \
+            -name "gradlew" -o \
+            -name "build.gradle" -o \
+            -name "build.gradle.kts" -o \
+            -name "pom.xml" \
+          \) | while read file; do
+
+            dir=$(dirname "$file")
+            echo "Derleniyor: $dir"
+            
+            cd "$GITHUB_WORKSPACE/$dir"
+
+            if [ -f "./gradlew" ]; then
+              chmod +x ./gradlew
+              ./gradlew build --no-daemon || true
+            elif [ -f "build.gradle" ] || [ -f "build.gradle.kts" ]; then
+              gradle build --no-daemon || true
+            elif [ -f "pom.xml" ]; then
+              mvn package -DskipTests || true
+            fi
+
+            cd "$GITHUB_WORKSPACE"
+          done
+
+      - name: JAR Dosyalarını Topla
+        run: |
+          mkdir -p output
+          find extracted -type f -name "*.jar" \
+            -path "*/build/libs/*" -exec cp {} output/ \; \
+            -o -path "*/target/*" -name "*.jar" \
+            -exec cp {} output/ \;
+
+      - name: JAR Dosyalarını İndirilebilir Yap
+        uses: actions/upload-artifact@v4
+        with:
+          name: GreenLemon-JARs
+          path: output/*.jar
+          if-no-files-found: error
